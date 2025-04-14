@@ -4,7 +4,7 @@ use keter::lang::types::vector::{Vec2, Vec3, Vec4};
 use keter::prelude::*;
 use keter_testbed::{App, KeyCode};
 
-const WORLD_SIZE: u32 = 64;
+const WORLD_SIZE: u32 = 128;
 const DISPLAY_SIZE: u32 = 2048;
 const SCALE: u32 = DISPLAY_SIZE / WORLD_SIZE;
 
@@ -118,23 +118,90 @@ struct World {
     // First bit is which end point.
     world_portals: Tex2d<Vec4<u32>>,
 }
+impl World {
+    #[tracked]
+    fn trace_line(&self, ray_start: Expr<Vec2<f32>>, ray_dir: Expr<Vec2<f32>>) -> Expr<Vec2<f32>> {
+        let length = ray_dir.norm();
+        let ray_dir = ray_dir / length;
+        let inv_dir = (ray_dir + f32::EPSILON).recip();
+        let pos = ray_start.floor().cast_i32().var();
+        let delta_dist = inv_dir.abs();
+
+        let ray_step = ray_dir.signum().cast_i32();
+        let side_dist =
+            (ray_dir.signum() * (pos.cast_f32() - ray_start) + ray_dir.signum() * 0.5 + 0.5)
+                * delta_dist;
+        let side_dist = side_dist.var();
+
+        let rotation = 0_u32.var();
+
+        for i in 0..10 {
+            let next_t = side_dist.reduce_min();
+
+            if next_t >= length {
+                break;
+            }
+            let mask = side_dist <= side_dist.yx();
+
+            *side_dist += mask.select(delta_dist, Vec2::splat_expr(0.0));
+
+            let step = mask.select(ray_step, Vec2::splat_expr(0));
+            let step_dir = if step.x == -1 {
+                0_u32.expr()
+            } else if step.x == 1 {
+                2.expr()
+            } else if step.y == -1 {
+                1.expr()
+            } else {
+                3.expr()
+            };
+            let step_dir = (step_dir + rotation) % 4;
+
+            let portal = if (pos.cast_u32() < WORLD_SIZE).all() {
+                Expr::<[u32; 4]>::from(self.world_portals.read(pos.cast_u32())).read(step_dir)
+            } else {
+                u32::MAX.expr()
+            };
+            if portal != u32::MAX {
+                let portal = self.portals.read(portal / 2).endpoints.read(portal % 2);
+                *rotation = (rotation + portal.dir + (4 - step_dir) + 2) % 4;
+                *pos = portal.cell.cast_i32();
+            } else {
+                *pos += step;
+            }
+        }
+        let fract = (ray_dir * length + ray_start).fract();
+
+        let fract = if rotation == 0 {
+            fract
+        } else if rotation == 1 {
+            Vec2::expr(1.0 - fract.y, fract.x)
+        } else if rotation == 2 {
+            Vec2::expr(1.0 - fract.x, 1.0 - fract.y)
+        } else {
+            Vec2::expr(fract.y, 1.0 - fract.x)
+        };
+
+        pos.cast_f32() + fract
+    }
+}
 
 fn main() {
     let app = App::new("Mobius", [WORLD_SIZE; 2]).scale(SCALE).init();
 
     let mut portals = vec![];
-    for x in WORLD_SIZE / 4..3 * WORLD_SIZE / 4 {
+    for x in 3 * WORLD_SIZE / 8..5 * WORLD_SIZE / 8 {
         portals.push(Portal {
             endpoints: [
                 PortalEndpoint {
                     velocity: 0.0,
-                    cell: Vec2::new(x, WORLD_SIZE / 4),
+                    cell: Vec2::new(x - WORLD_SIZE / 4, 2 * WORLD_SIZE / 4),
                     dir: 1,
                 },
                 PortalEndpoint {
                     velocity: 0.0,
-                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4),
-                    dir: 3,
+                    cell: Vec2::new(x + WORLD_SIZE / 4, 3 * WORLD_SIZE / 4),
+                    dir: 1,
                 },
             ],
         });
@@ -142,13 +209,13 @@ fn main() {
             endpoints: [
                 PortalEndpoint {
                     velocity: 0.0,
-                    cell: Vec2::new(x, WORLD_SIZE / 4 - 1),
+                    cell: Vec2::new(x - WORLD_SIZE / 4, 2 * WORLD_SIZE / 4 - 1),
                     dir: 3,
                 },
                 PortalEndpoint {
                     velocity: 0.0,
-                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4 + 1),
-                    dir: 1,
+                    cell: Vec2::new(x + WORLD_SIZE / 4, 3 * WORLD_SIZE / 4 - 1),
+                    dir: 3,
                 },
             ],
         });
@@ -263,7 +330,10 @@ fn main() {
             if (tracer <= 0.01).any() || (tracer >= WORLD_SIZE as f32 - 0.01).any() {
                 *tracer = pcg3df(Vec3::expr(dispatch_id().x, 153, t)).xy() * WORLD_SIZE as f32;
             }
-            *tracer += VectorField::at(gravity, **tracer) * 0.1;
+            *tracer = world.trace_line(**tracer, VectorField::at(gravity, **tracer) * 0.1);
+            if (!tracer.is_finite()).any() {
+                *tracer = Vec2::splat_expr(-1.0);
+            }
             tracers.write(dispatch_id().x, tracer);
             tracer_display.write(
                 (tracer * (SCALE) as f32).cast_u32(),
