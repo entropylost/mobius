@@ -76,6 +76,19 @@ fn perp_axis() -> [Vec2<u32>; 4] {
     [Vec2::y(), Vec2::x(), Vec2::y(), Vec2::x()]
 }
 
+#[tracked]
+fn rotate(v: Expr<Vec2<f32>>, rotation: Expr<u32>) -> Expr<Vec2<f32>> {
+    if rotation == 0 {
+        v
+    } else if rotation == 1 {
+        Vec2::expr(-v.y, v.x)
+    } else if rotation == 2 {
+        Vec2::expr(-v.x, -v.y)
+    } else {
+        Vec2::expr(v.y, -v.x)
+    }
+}
+
 struct VectorField {
     // All values are pointing outwards.
     values: Tex2d<Vec4<f32>>,
@@ -130,7 +143,11 @@ impl World {
         self.world_portals.write(index, value);
     }
     #[tracked]
-    fn trace_line(&self, ray_start: Expr<Vec2<f32>>, ray_dir: Expr<Vec2<f32>>) -> Expr<Vec2<f32>> {
+    fn trace_line(
+        &self,
+        ray_start: Expr<Vec2<f32>>,
+        ray_dir: Expr<Vec2<f32>>,
+    ) -> (Expr<Vec2<f32>>, Expr<u32>) {
         let length = ray_dir.norm();
         let ray_dir = ray_dir / length;
         let inv_dir = (ray_dir + f32::EPSILON).recip();
@@ -192,8 +209,15 @@ impl World {
             Vec2::expr(fract.y, 1.0 - fract.x)
         };
 
-        pos.cast_f32() + fract
+        (pos.cast_f32() + fract, **rotation)
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Value)]
+struct Object {
+    pos: Vec2<f32>,
+    vel: Vec2<f32>,
 }
 
 fn main() {
@@ -210,8 +234,8 @@ fn main() {
                 },
                 PortalEndpoint {
                     velocity: 0.0,
-                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4),
-                    dir: 1,
+                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4 - 1),
+                    dir: 3,
                 },
             ],
         });
@@ -224,8 +248,8 @@ fn main() {
                 },
                 PortalEndpoint {
                     velocity: 0.0,
-                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4 - 1),
-                    dir: 3,
+                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4),
+                    dir: 1,
                 },
             ],
         });
@@ -290,7 +314,10 @@ fn main() {
         }),
     );
 
-    let tracers = DEVICE.create_buffer_from_fn::<Vec2<f32>>(1000, |_| Vec2::splat(-1.0));
+    let tracers = DEVICE.create_buffer_from_fn::<Object>(1000, |_| Object {
+        pos: Vec2::splat(-1.0),
+        vel: Vec2::splat(0.0),
+    });
     let tracer_display = DEVICE.create_tex2d(PixelStorage::Float4, DISPLAY_SIZE, DISPLAY_SIZE, 1);
 
     let draw =
@@ -331,19 +358,19 @@ fn main() {
     let update_tracers =
         DEVICE.create_kernel::<fn(Tex2d<Vec4<f32>>, u32)>(&track!(|gravity, t| {
             let tracer = tracers.read(dispatch_id().x).var();
-            if (tracer <= 0.01).any() || (tracer >= WORLD_SIZE as f32 - 0.01).any() {
-                *tracer = pcg3df(Vec3::expr(dispatch_id().x, 153, t)).xy() * WORLD_SIZE as f32;
+            if (tracer.pos <= 0.01).any() || (tracer.pos >= WORLD_SIZE as f32 - 0.01).any() {
+                *tracer.pos = pcg3df(Vec3::expr(dispatch_id().x, 153, t)).xy() * WORLD_SIZE as f32;
+                *tracer.vel = Vec2::expr(0.0, 0.0);
             }
-            *tracer = world.trace_line(
-                **tracer,
-                VectorField::at(gravity, **tracer) * 4.0 / SCALE as f32,
-            );
-            if (!tracer.is_finite()).any() {
-                *tracer = Vec2::splat_expr(-1.0);
-            }
+            // +=
+            *tracer.vel = VectorField::at(gravity.clone(), **tracer.pos) * 0.1;
+            let (next_pos, rotation) = world.trace_line(**tracer.pos, **tracer.vel);
+            // TODO: This doesn't handle mirrored portals correctly.
+            *tracer.vel = rotate(**tracer.vel, rotation);
+            *tracer.pos = next_pos;
             tracers.write(dispatch_id().x, tracer);
             tracer_display.write(
-                (tracer * (SCALE) as f32).cast_u32(),
+                (tracer.pos * (SCALE) as f32).cast_u32(),
                 Vec4::splat(1.0).expr(),
             );
         }));
