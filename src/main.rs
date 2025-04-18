@@ -220,20 +220,20 @@ struct Object {
     vel: Vec2<f32>,
 }
 
-fn main() {
-    let app = App::new("Mobius", [WORLD_SIZE; 2]).scale(SCALE).init();
-
+fn gen_portals(t: f32) -> Vec<Portal> {
     let mut portals = vec![];
+    let p = ((WORLD_SIZE / 4) as f32 + 10.0 * (t * 0.016).sin()).round() as u32;
+    let v = 10.0 * (t * 0.016).cos() * 0.016;
     for x in WORLD_SIZE / 4..3 * WORLD_SIZE / 4 {
         portals.push(Portal {
             endpoints: [
                 PortalEndpoint {
-                    velocity: 0.0,
-                    cell: Vec2::new(x, WORLD_SIZE / 4),
+                    velocity: v,
+                    cell: Vec2::new(x, p),
                     dir: 1,
                 },
                 PortalEndpoint {
-                    velocity: 0.0,
+                    velocity: v,
                     cell: Vec2::new(x, 3 * WORLD_SIZE / 4 - 1),
                     dir: 3,
                 },
@@ -242,28 +242,39 @@ fn main() {
         portals.push(Portal {
             endpoints: [
                 PortalEndpoint {
-                    velocity: 0.0,
-                    cell: Vec2::new(x, WORLD_SIZE / 4 - 1),
+                    velocity: -v,
+                    cell: Vec2::new(x, p - 1),
                     dir: 3,
                 },
                 PortalEndpoint {
-                    velocity: 0.0,
+                    velocity: -v,
                     cell: Vec2::new(x, 3 * WORLD_SIZE / 4),
                     dir: 1,
                 },
             ],
         });
     }
+    portals
+}
+
+fn main() {
+    let app = App::new("Mobius", [WORLD_SIZE; 2]).scale(SCALE).init();
 
     let mut gravity = VectorField::new();
     let mut staging = DEVICE.create_tex2d(PixelStorage::Float4, WORLD_SIZE, WORLD_SIZE, 1);
 
     let world = World {
-        portals: DEVICE.create_buffer_from_slice(&portals),
+        portals: DEVICE.create_buffer_from_slice(&gen_portals(0.0)),
         world_portals: DEVICE
             .create_buffer_from_fn((WORLD_SIZE * WORLD_SIZE * 4) as usize, |_| u32::MAX),
     };
 
+    let reset_world = DEVICE.create_kernel::<fn()>(&track!(|| {
+        let cell = dispatch_id().xy();
+        for i in 0..4_u32 {
+            world.write(cell, i, u32::MAX.expr());
+        }
+    }));
     let update_world = DEVICE.create_kernel::<fn()>(&track!(|| {
         let index = dispatch_id().x;
         let portal = world.portals.read(index);
@@ -273,8 +284,6 @@ fn main() {
             world.write(cell, endpoint.dir, index * 2 + (1 - i));
         }
     }));
-    // reset_world.dispatch([WORLD_SIZE, WORLD_SIZE, 1]);
-    update_world.dispatch([world.portals.len() as u32, 1, 1]);
 
     let divergence_solve = DEVICE.create_kernel::<fn(Tex2d<Vec4<f32>>, Tex2d<Vec4<f32>>)>(&track!(
         |field, next_field| {
@@ -294,10 +303,12 @@ fn main() {
                 let neighbor = (cell + dir.expr().cast_u32()).var();
                 let neighbor_dir = opposite(i).var();
                 let portal = world.read(cell, i.expr());
+                let velocity = 0.0_f32.var();
                 if portal != u32::MAX {
                     let other_endpoint = world.portals.read(portal / 2).endpoints.read(portal % 2);
                     *neighbor = other_endpoint.cell;
                     *neighbor_dir = other_endpoint.dir;
+                    *velocity = other_endpoint.velocity;
                 }
                 if (neighbor >= WORLD_SIZE).any() {
                     *v = if negative(i) { -1.0 } else { 1.0 }
@@ -305,7 +316,7 @@ fn main() {
                 } else {
                     if portal != u32::MAX || world.read(**neighbor, **neighbor_dir) == u32::MAX {
                         let neighbor = field.read(neighbor);
-                        let n = -in_dir(neighbor, **neighbor_dir);
+                        let n = -(in_dir(neighbor, **neighbor_dir) + velocity);
                         *v = (v + n) * 0.5;
                     }
                 }
@@ -314,7 +325,7 @@ fn main() {
         }),
     );
 
-    let tracers = DEVICE.create_buffer_from_fn::<Object>(1000, |_| Object {
+    let tracers = DEVICE.create_buffer_from_fn::<Object>(10, |_| Object {
         pos: Vec2::splat(-1.0),
         vel: Vec2::splat(0.0),
     });
@@ -360,11 +371,13 @@ fn main() {
             let tracer = tracers.read(dispatch_id().x).var();
             if (tracer.pos <= 0.01).any() || (tracer.pos >= WORLD_SIZE as f32 - 0.01).any() {
                 *tracer.pos = pcg3df(Vec3::expr(dispatch_id().x, 153, t)).xy() * WORLD_SIZE as f32;
-                *tracer.vel = Vec2::expr(0.0, 0.0);
+                *tracer.vel = (pcg3df(Vec3::expr(dispatch_id().x, 121, t)).xy() * 1.0 - 0.5) * 0.1;
             }
             // +=
-            *tracer.vel = VectorField::at(gravity.clone(), **tracer.pos) * 0.1;
-            let (next_pos, rotation) = world.trace_line(**tracer.pos, **tracer.vel);
+            let (next_pos, rotation) = world.trace_line(
+                **tracer.pos,
+                (**tracer.vel + VectorField::at(gravity.clone(), **tracer.pos)), // * 0.016,
+            );
             // TODO: This doesn't handle mirrored portals correctly.
             *tracer.vel = rotate(**tracer.vel, rotation);
             *tracer.pos = next_pos;
@@ -389,6 +402,12 @@ fn main() {
             show_divergence = !show_divergence;
         }
         rt.log_fps();
+
+        // println!("Len: {:?}", gen_portals(rt.tick as f32 * 0.016).len());
+        world.portals.copy_from(&gen_portals(rt.tick as f32));
+        reset_world.dispatch([WORLD_SIZE, WORLD_SIZE, 1]);
+        update_world.dispatch([world.portals.len() as u32, 1, 1]);
+
         for _ in 0..100 {
             divergence_solve.dispatch([WORLD_SIZE, WORLD_SIZE, 1], &gravity.values, &staging);
             swap(&mut gravity.values, &mut staging);
@@ -396,7 +415,7 @@ fn main() {
                 [WORLD_SIZE, WORLD_SIZE, 1],
                 &gravity.values,
                 &staging,
-                &Vec2::new(0.0, 1.0),
+                &Vec2::new(0.0, 0.0),
             );
             swap(&mut gravity.values, &mut staging);
         }
