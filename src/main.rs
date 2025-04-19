@@ -89,6 +89,17 @@ fn rotate(v: Expr<Vec2<f32>>, rotation: Expr<u32>) -> Expr<Vec2<f32>> {
     }
 }
 
+struct PotentialField {
+    values: Tex2d<f32>,
+}
+impl PotentialField {
+    fn new() -> Self {
+        Self {
+            values: DEVICE.create_tex2d(PixelStorage::Float1, WORLD_SIZE, WORLD_SIZE, 1),
+        }
+    }
+}
+
 struct VectorField {
     // All values are pointing outwards.
     values: Tex2d<Vec4<f32>>,
@@ -141,6 +152,16 @@ impl World {
     fn write(&self, cell: Expr<Vec2<u32>>, dir: Expr<u32>, value: Expr<u32>) {
         let index = 4 * (cell.x * WORLD_SIZE + cell.y) + dir;
         self.world_portals.write(index, value);
+    }
+    #[tracked]
+    fn adjacent(&self, cell: Expr<Vec2<u32>>, dir: Expr<u32>) -> Expr<Vec2<u32>> {
+        let portal = self.read(cell, dir);
+        if portal != u32::MAX {
+            let portal = self.portals.read(portal / 2).endpoints.read(portal % 2);
+            portal.cell
+        } else {
+            cell + directions().expr().read(dir).cast_u32()
+        }
     }
     #[tracked]
     fn trace_line(
@@ -217,24 +238,22 @@ impl World {
 #[derive(Debug, Clone, Copy, PartialEq, Value)]
 struct Object {
     pos: Vec2<f32>,
-    vel: Vec2<f32>,
+    // vel: Vec2<f32>,
 }
 
-fn gen_portals(t: f32) -> Vec<Portal> {
+fn gen_portals() -> Vec<Portal> {
     let mut portals = vec![];
-    let p = ((WORLD_SIZE / 4) as f32 + 10.0 * (t * 0.016).sin()).round() as u32;
-    let v = 10.0 * (t * 0.016).cos() * 0.016;
-    for x in WORLD_SIZE / 4..3 * WORLD_SIZE / 4 {
+    for x in 15 * WORLD_SIZE / 32..17 * WORLD_SIZE / 32 {
         portals.push(Portal {
             endpoints: [
                 PortalEndpoint {
-                    velocity: v,
-                    cell: Vec2::new(x, p),
+                    velocity: 0.0,
+                    cell: Vec2::new(x + WORLD_SIZE / 4, 3 * WORLD_SIZE / 4),
                     dir: 1,
                 },
                 PortalEndpoint {
-                    velocity: v,
-                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4 - 1),
+                    velocity: 0.0,
+                    cell: Vec2::new(x - WORLD_SIZE / 4, WORLD_SIZE / 4 - 1),
                     dir: 3,
                 },
             ],
@@ -242,13 +261,13 @@ fn gen_portals(t: f32) -> Vec<Portal> {
         portals.push(Portal {
             endpoints: [
                 PortalEndpoint {
-                    velocity: -v,
-                    cell: Vec2::new(x, p - 1),
+                    velocity: 0.0,
+                    cell: Vec2::new(x + WORLD_SIZE / 4, 3 * WORLD_SIZE / 4 - 1),
                     dir: 3,
                 },
                 PortalEndpoint {
-                    velocity: -v,
-                    cell: Vec2::new(x, 3 * WORLD_SIZE / 4),
+                    velocity: 0.0,
+                    cell: Vec2::new(x - WORLD_SIZE / 4, WORLD_SIZE / 4),
                     dir: 1,
                 },
             ],
@@ -260,11 +279,12 @@ fn gen_portals(t: f32) -> Vec<Portal> {
 fn main() {
     let app = App::new("Mobius", [WORLD_SIZE; 2]).scale(SCALE).init();
 
-    let mut gravity = VectorField::new();
-    let mut staging = DEVICE.create_tex2d(PixelStorage::Float4, WORLD_SIZE, WORLD_SIZE, 1);
+    let mut gravity_pt = PotentialField::new();
+    let mut gravity_vc = VectorField::new();
+    let mut staging = DEVICE.create_tex2d(PixelStorage::Float1, WORLD_SIZE, WORLD_SIZE, 1);
 
     let world = World {
-        portals: DEVICE.create_buffer_from_slice(&gen_portals(0.0)),
+        portals: DEVICE.create_buffer_from_slice(&gen_portals()),
         world_portals: DEVICE
             .create_buffer_from_fn((WORLD_SIZE * WORLD_SIZE * 4) as usize, |_| u32::MAX),
     };
@@ -285,62 +305,63 @@ fn main() {
         }
     }));
 
-    let divergence_solve = DEVICE.create_kernel::<fn(Tex2d<Vec4<f32>>, Tex2d<Vec4<f32>>)>(&track!(
-        |field, next_field| {
-            let cell = dispatch_id().xy();
-            let divergence = field.read(cell).var();
-            *divergence -= divergence.reduce_sum() / 4.0 * 1.9;
-            next_field.write(cell, divergence);
-        }
-    ));
-    let realign = DEVICE.create_kernel::<fn(Tex2d<Vec4<f32>>, Tex2d<Vec4<f32>>, Vec2<f32>)>(
-        &track!(|field, next_field, boundary| {
-            let cell = dispatch_id().xy();
-            let divergence = field.read(cell).var();
-            for i in (0..4_u32) {
-                let dir = directions()[i as usize];
-                let v = in_dir_var(divergence, i);
-                let neighbor = (cell + dir.expr().cast_u32()).var();
-                let neighbor_dir = opposite(i).var();
-                let portal = world.read(cell, i.expr());
-                let velocity = 0.0_f32.var();
-                if portal != u32::MAX {
-                    let other_endpoint = world.portals.read(portal / 2).endpoints.read(portal % 2);
-                    *neighbor = other_endpoint.cell;
-                    *neighbor_dir = other_endpoint.dir;
-                    *velocity = other_endpoint.velocity;
-                }
-                if (neighbor >= WORLD_SIZE).any() {
-                    *v = if negative(i) { -1.0 } else { 1.0 }
-                        * if axis(i) == 0 { boundary.x } else { boundary.y };
-                } else {
-                    if portal != u32::MAX || world.read(**neighbor, **neighbor_dir) == u32::MAX {
-                        let neighbor = field.read(neighbor);
-                        let n = -(in_dir(neighbor, **neighbor_dir) + velocity);
-                        *v = (v + n) * 0.5;
-                    }
-                }
-            }
-            next_field.write(cell, divergence);
-        }),
-    );
+    reset_world.dispatch([WORLD_SIZE, WORLD_SIZE, 1]);
+    update_world.dispatch([world.portals.len() as u32, 1, 1]);
 
-    let tracers = DEVICE.create_buffer_from_fn::<Object>(10, |_| Object {
+    let solve = DEVICE.create_kernel::<fn(Tex2d<f32>, Tex2d<f32>)>(&track!(|field, next_field| {
+        let cell = dispatch_id().xy();
+        let value = field.read(cell);
+        let laplacian = (value).var();
+        for i in (0..4_u32) {
+            let adj = world.adjacent(cell, i.expr());
+            if (adj >= WORLD_SIZE).any() {
+                *laplacian -= cell.y.cast_f32() * 1.0 * 0.25;
+            } else {
+                *laplacian -= field.read(adj) * 0.25;
+            }
+        }
+        next_field.write(cell, value - laplacian); // Should actually overshoot by 1.9 for increased speed.
+    }));
+    let write_vc =
+        DEVICE.create_kernel::<fn(Tex2d<f32>, Tex2d<Vec4<f32>>)>(&track!(|potential, field| {
+            let cell = dispatch_id().xy();
+            let value = potential.read(cell);
+            let grad = [0.0_f32; 4].var();
+            for i in (0..4_u32) {
+                let adj = world.adjacent(cell, i.expr());
+                grad.write(
+                    i,
+                    if (adj >= WORLD_SIZE).any() {
+                        cell.y.cast_f32()
+                    } else {
+                        potential.read(adj)
+                    } - value,
+                );
+            }
+            field.write(cell, Expr::<Vec4<f32>>::from(**grad));
+        }));
+
+    let tracers = DEVICE.create_buffer_from_fn::<Object>(1000, |_| Object {
         pos: Vec2::splat(-1.0),
-        vel: Vec2::splat(0.0),
+        // vel: Vec2::splat(0.0),
     });
     let tracer_display = DEVICE.create_tex2d(PixelStorage::Float4, DISPLAY_SIZE, DISPLAY_SIZE, 1);
 
-    let draw =
-        DEVICE.create_kernel::<fn(Tex2d<Vec4<f32>>, bool)>(&track!(|field, show_divergence| {
+    let draw = DEVICE.create_kernel::<fn(Tex2d<f32>, Tex2d<Vec4<f32>>, u32)>(&track!(
+        |potential, field, show| {
             let cell = dispatch_id().xy();
             let pos = cell.cast_f32() + 0.5;
             app.set_pixel(
                 cell.cast_i32(),
-                if show_divergence {
+                if show == 0 {
+                    // potential
+                    potential.read(cell) * 0.01 * Vec3::new(0.02528, 0.04127, 0.1713)
+                } else if show == 1 {
+                    // divergence
                     let dv = field.read(cell).reduce_sum();
                     dv.abs() * 2.0 * Vec3::new(1.0, 0.0, 0.0)
                 } else {
+                    // field
                     let v = VectorField::at(field.clone(), pos);
                     let colors = [
                         Vec3::new(0.64178, 0.22938, 0.33132), // 0
@@ -364,22 +385,23 @@ fn main() {
                     }
                 }
             }
-        }));
+        }
+    ));
 
     let update_tracers =
         DEVICE.create_kernel::<fn(Tex2d<Vec4<f32>>, u32)>(&track!(|gravity, t| {
             let tracer = tracers.read(dispatch_id().x).var();
             if (tracer.pos <= 0.01).any() || (tracer.pos >= WORLD_SIZE as f32 - 0.01).any() {
                 *tracer.pos = pcg3df(Vec3::expr(dispatch_id().x, 153, t)).xy() * WORLD_SIZE as f32;
-                *tracer.vel = (pcg3df(Vec3::expr(dispatch_id().x, 121, t)).xy() * 1.0 - 0.5) * 0.1;
+                // *tracer.vel = (pcg3df(Vec3::expr(dispatch_id().x, 121, t)).xy() * 1.0 - 0.5) * 0.1;
             }
             // +=
-            let (next_pos, rotation) = world.trace_line(
+            let (next_pos, _) = world.trace_line(
                 **tracer.pos,
-                (**tracer.vel + VectorField::at(gravity.clone(), **tracer.pos)), // * 0.016,
+                VectorField::at(gravity.clone(), **tracer.pos) * 0.1, // * 0.016,
             );
             // TODO: This doesn't handle mirrored portals correctly.
-            *tracer.vel = rotate(**tracer.vel, rotation);
+            // *tracer.vel = rotate(**tracer.vel, rotation);
             *tracer.pos = next_pos;
             tracers.write(dispatch_id().x, tracer);
             tracer_display.write(
@@ -395,36 +417,35 @@ fn main() {
         tracer_display.write(pixel, value);
     }));
 
-    let mut show_divergence = false;
+    let mut show = 0_u32;
 
     app.run(|rt| {
         if rt.key_pressed(KeyCode::KeyD) {
-            show_divergence = !show_divergence;
+            show = (show + 1) % 3;
         }
         rt.log_fps();
 
         // println!("Len: {:?}", gen_portals(rt.tick as f32 * 0.016).len());
-        world.portals.copy_from(&gen_portals(rt.tick as f32));
-        reset_world.dispatch([WORLD_SIZE, WORLD_SIZE, 1]);
-        update_world.dispatch([world.portals.len() as u32, 1, 1]);
+        // world.portals.copy_from(&gen_portals(rt.tick as f32));
+        // reset_world.dispatch([WORLD_SIZE, WORLD_SIZE, 1]);
+        // update_world.dispatch([world.portals.len() as u32, 1, 1]);
 
         for _ in 0..100 {
-            divergence_solve.dispatch([WORLD_SIZE, WORLD_SIZE, 1], &gravity.values, &staging);
-            swap(&mut gravity.values, &mut staging);
-            realign.dispatch(
+            solve.dispatch([WORLD_SIZE, WORLD_SIZE, 1], &gravity_pt.values, &staging);
+            swap(&mut gravity_pt.values, &mut staging);
+            write_vc.dispatch(
                 [WORLD_SIZE, WORLD_SIZE, 1],
-                &gravity.values,
-                &staging,
-                &Vec2::new(0.0, 0.0),
+                &gravity_pt.values,
+                &gravity_vc.values,
             );
-            swap(&mut gravity.values, &mut staging);
         }
-        update_tracers.dispatch([tracers.len() as u32, 1, 1], &gravity.values, &rt.tick);
+        update_tracers.dispatch([tracers.len() as u32, 1, 1], &gravity_vc.values, &rt.tick);
         draw_tracers.dispatch([DISPLAY_SIZE, DISPLAY_SIZE, 1]);
         draw.dispatch(
             [WORLD_SIZE, WORLD_SIZE, 1],
-            &gravity.values,
-            &show_divergence,
+            &gravity_pt.values,
+            &gravity_vc.values,
+            &show,
         );
     });
 }
